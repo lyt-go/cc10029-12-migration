@@ -2,12 +2,17 @@
 
 本模块识别源端记录格式的结构差异字段（新增/删除/重命名），在源端格式版本升级时
 创建适配版本记录并写入适配产物文件，确保下游目标端能兼容新旧格式。
+
+格式适配与增量窗口共同使用版本化窗口结构清单（app.window_manifest）：
+执行适配时根据产物实际包含的字段，对照清单解析旧名和新名并完成重命名，
+保留原记录键。
 """
 from __future__ import annotations
 
 import time
 from typing import Any
 
+from app import window_manifest
 from app.services.base import BaseModuleService
 from app.store import store
 
@@ -59,10 +64,11 @@ class FormatAdaptService(BaseModuleService):
         return entry
 
     def execute_adaptation(self, adapt_id: int, batch_code: str) -> dict[str, Any]:
-        """执行格式适配：将源端记录按新旧格式转换并写入适配产物文件。
+        """执行格式适配：按产物实际包含的字段对照版本化窗口结构清单解析旧名和新名。
 
         本方法是数据交换平台格式兼容的关键环节：
-        读取批次传输产物文件，识别差异字段进行新旧格式转换，
+        读取批次传输产物文件，与增量窗口共同使用版本化窗口结构清单，
+        根据产物实际包含的字段把旧名记录转换为新名结构（保留原记录键），
         输出适配后的产物文件供下游目标端消费。
         """
         adapt_entry = self.get_entry(adapt_id)
@@ -82,14 +88,27 @@ class FormatAdaptService(BaseModuleService):
         if not records:
             records = self._simulate_records(batch_code, count=5, field_prefix="fmt")
 
+        # 根据产物实际包含的字段，对照版本化窗口结构清单解析旧名→新名
+        actual_fields: set[str] = set()
+        for rec in records:
+            actual_fields.update(rec.keys())
+        resolved_renames = window_manifest.resolve_renames(actual_fields)
+        artifact_version = window_manifest.detect_version(actual_fields)
+
         # 执行新旧格式转换
         adapted = []
         for rec in records:
             new_rec = {}
+            # 清单解析出的旧名字段改为新名，其余字段（含原记录键）原样保留
+            for key, value in rec.items():
+                new_rec[resolved_renames.get(key, key)] = value
+            # 适配条目声明的旧版结构→新版结构（兼容历史适配行为）
             for i, new_f in enumerate(new_fields):
+                if new_f in new_rec:
+                    continue
                 if i < len(old_fields) and old_fields[i] in rec:
                     new_rec[new_f] = rec[old_fields[i]]
-                else:
+                elif new_f not in rec:
                     new_rec[new_f] = f"default_{new_f}"
             new_rec["_adapt_version"] = adapt_entry["适配版本"]
             adapted.append(new_rec)
@@ -106,4 +125,6 @@ class FormatAdaptService(BaseModuleService):
             "batch_code": batch_code,
             "records_adapted": written,
             "artifact_path": str(output_file),
+            "artifact_version": artifact_version,
+            "resolved_renames": resolved_renames,
         }
